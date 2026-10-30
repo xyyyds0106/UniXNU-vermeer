@@ -6,13 +6,18 @@
 # recorded from build/darwinboot-storage-native-metadata/gdb-stop.json), and its verified bundles
 # need volume policies outside the repositories, so a clean CI checkout cannot reproduce them.
 # BootProgress links native_virtio_*/native_owner_root_* directly, so it stays off with them.
+# CONFIG_XNU_NATIVE_UFS belongs to that same chain and is off for the same reason: ShengUfs
+# references IOBlockStorageDevice, which build-virtio-mmio-bindings.py binds to the original
+# kernelcache only after build/storage-abi/interface-audit.json qualifies it, and
+# _verified_root_* from build-verified-root-probe.py, which needs the volume policies above.
+# Turning it on without those does not fail in configuration; it fails at the kernel link.
 
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
-CONFIG_XNU_NATIVE_UFS=y
+CONFIG_XNU_NATIVE_UFS=n
 CONFIG_XNU_NATIVE_AES=y
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
@@ -22,7 +27,7 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
-CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
 CONFIG_XNU_NATIVE_ADRENO=y
 
 # Off until the live storage metadata observation is recorded on this device.
@@ -36,10 +41,23 @@ CONFIG_XNU_OWNER_CACHE_STARTUP=n
 CONFIG_XNU_OWNER_BOOT_MANIFEST=n
 CONFIG_XNU_OWNER_DATA_MOUNT=n
 CONFIG_XNU_OWNER_UNION_SYSTEMOS=n
-CONFIG_XNU_BOOT_PROGRESS=n
+# On, and this time the gate it needs is satisfied. The four-way interlock in
+# build-xnu-4k-baseline.sh:79-82 exists for the full kits/vermeer/BootProgress.c,
+# which reads UFS, Virtio, ADSP, touch, GPU and cpufreq counters; ishtar's
+# scripts/build-boot-progress-min.py records that it fails on about 118 undefined
+# symbols in a slim configuration. This board builds kits/vermeer/BootProgressMin.c
+# instead -- one hard extern, physmap_base, everything else weak_import -- and the
+# board copy of the baseline script relaxes the interlock to the crypto provider
+# alone, which is CONFIG_XNU_SOURCE_CORECRYPTO14=y at line 16.
+CONFIG_XNU_BOOT_PROGRESS=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_OWNER_DATA_VOLUME_UUID="18AB5557-DC2D-469B-8758-855E60F5B0DF"
 CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
 CONFIG_XNU_ARMVIRT_PLATFORM=n
+
+# First boot to console: build-sheng-platform-power.py and build-native-legacy-display.py
+# both require a hardware-confirmed prelink reference candidate (build/*-prelink/native-owner-*-candidate.macho),
+# which migration.md step 7 lists as a user-supplied build input and a clean checkout cannot produce.
+# Turning these two off drops exactly those archives; everything else this board selects builds without one.

@@ -1,3 +1,5 @@
+"schema_version" = 2
+
 # Board description of the Redmi K70 (vermeer, SM8550), read by the unixnu build driver.
 # Ported from the proven sheng (Xiaomi Pad 6S Pro) board: same SM8550 SoC, same stock UEFI
 # memory windows (uefiplat.cfg of the K70 OS1.0.x firmware confirms: UEFI FD 0xA7000000,
@@ -8,6 +10,8 @@ name = "vermeer"
 soc = "SM8550"
 description = "Redmi K70"
 kit = "vermeer"                    # the package/ of this repository appears as kits/vermeer in the build tree
+soc_source = "sm8550"
+os_profile = "ipados-17.7.11-21H461"
 
 # The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image, identical to sheng
 # (the whole qualified chain - prelink roots, trust caches, kernel args - targets this build).
@@ -28,8 +32,8 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 # The raw image for the userdata partition. TODO: replace with the GPT entry "userdata" of
 # LUN 0 read from this K70 (fastboot: `fastboot oem get-partition-info userdata` or a GPT dump).
 [userdata]
-first_lba = 0x2f3840
-last_lba = 0x3d0abfa
+first_lba = 0x273840
+last_lba = 0x3afa3fa
 lba_bytes = 4096
 windows = [
   { name = "OS", component = "OS" },
@@ -38,6 +42,8 @@ windows = [
 
 [kernel]
 defconfig = "vermeer_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/sm8550.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
 # Archive builders of the kernel step, in order (SoC-level components, as sheng).
 # The VirtIO block/ram-block builders and their storage-binding post-processing are absent:
 # build-native-virtio-bindings.py reads build/storage-abi/interface-audit.json, which is
@@ -45,18 +51,18 @@ defconfig = "vermeer_defconfig"
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
-  "build-arm-driver.py ArmDTPlatform",
-  "build-arm-driver.py ArmCpu",
-  "build-arm-driver.py NativeAES",
-  "build-native-aes-bindings.py",
-  "build-arm-driver.py NativeUfs",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "component:SoftwareAES",
+  "build-software-aes-bindings.py",
+  "component:VirtioMmioBlock",
+  "component:ShengUfs",
   "build-mockfs-fixture.py",
   "build-sheng-platform-power.py",
   "build-libpthread-kernel.py",
-  "build-arm-driver.py NativeAdreno",
+  "component:Adreno740",
   "build-native-adreno-kits.py",
   "build-native-adreno-accelerator.py",
-  "build-native-legacy-display.py",
 ]
 
 [kernel.prelink]
@@ -99,6 +105,18 @@ roots = [
   "com.apple.iokit.IOHIDEventDriver",
 ]
 
+# Format 2 compiles this board DTS and hands the result to the shared ADT generator
+# (unixnu/payload.py -> devicetree.compile_hardware). All SoC resources come from the
+# pinned sm8550 DTSI; this file carries only the board values. The memory size must
+# equal [payload] dram_size - devicetree.generate() refuses a mismatch.
+[device_tree]
+source = "device:dts/vermeer.dts"
+include_dirs = ["soc:dts"]
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "ShengUfs", "VirtioMmioBlock", "VerifiedRoot",
+           "Adreno740", "XnuPrelink", "DarwinBoot"]
+
 [firmware]
 config = "vermeer"                 # Resources/Configs/vermeer.toml in the Mu-Silicium checkout (--uefi)
 dsc = "Platforms/Xiaomi/vermeerPkg/vermeer.dsc"
@@ -130,69 +148,113 @@ BUILDID_STRING = "vermeer-research"
 
 [payload]
 volume = "VERMEERESP"
-size_mib = 192
+# 64, measured on this device: a 192 MiB payload makes a 193 MB boot.img, and
+# `fastboot flash boot_b` refuses it with "Volume Full". 68,665,344 B (a 64 MiB
+# payload plus 1.5 MB of shim and firmware volume) is the largest image that has
+# been written to boot_b here. 192 was inherited from the sheng-family boards --
+# clover uses 56, fuxi 192, sheng 208, sirius 256 -- and is a property of each
+# device's boot partition, not of the kit. The 51 MB kernel leaves about 15 MB
+# for the firmware volume, DTB, ADT, data ramdisk and trust cache.
+size_mib = 64
 loader = "firmware"
 title = "vermeer first boot: source 4K XNU to console"
 dram_size = "0x80000000"             # conservative first-boot window, as sheng
 skip_setup_tool = "scripts/seed-data-skip-setup.py"   # used by --skip-setup
-panic_screen = true
+# Off for this round: scripts/patch-xnu-entry-probe.py puts the stage 4 reset in
+# cave 4, which leaves 0x970 of padding for the panic screen (PANIC_CAVE_END
+# 0xFFFFFFF00B9D0FF0 - CAVES[4] 0x...0620 - CAVE_SIZE 0x60) against the 0x9f5 it
+# needs, so the two cannot both be on and the tool exits rather than truncate.
+panic_screen = false
+
+# Stage 4 asks one question and answers it without a frame buffer: a reboot six
+# seconds in means the kernel got past the call, no reboot means it did not.
+# _mdevadd is 0xfffffff007477a58, called 21 times in the kernel but exactly once
+# from _IOFindBSDRoot (bl at 0xfffffff007982368), so occurrence 1 is that call.
+entry_probe_reset_delay = 6
+entry_probe_reset_after = "_mdevadd"
+entry_probe_reset_in = "_IOFindBSDRoot"
+entry_probe_reset_occurrence = 1
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
   "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
 ]
 kernel_args = [
+  # The set that has booted this device to a userspace exit status. Every entry
+  # here is live: -v, debug, kt_fixed_zones, cpus and -no_slto_panic are XNU's
+  # own, sheng-pmgr is read by package/ShengPlatformPower.cpp (archive 11), and
+  # rd=md0 selects the mockfs root. boot-progress is inert while
+  # CONFIG_XNU_BOOT_PROGRESS is n and is kept so it works when that flips.
   "-v",
-  "serial=3",
   "debug=0x14e",
   "kt_fixed_zones=120",
-  "offline-legacy-register=1",
-  "offline-legacy-gop=1",
-  "offline-legacy-unit-scale=2",
-  "offline-legacy-pm=1",
-  "offline-legacy-validate=1",
-  "offline-legacy-transfer=1",
-  "offline-legacy-cpu-present=1",
-  "offline-hid-home=1",
-  "offline-hid-input=1",
-  "offline-legacy-phase=4",
-  "offline-mobile-graphics-client=1",
-  "offline-mobile-graphics-load=1",
-  "offline-apfs-load=1",
+  "cpus=1",
   "boot-progress=2",
-  "-apfs_shared_datavolume",
-  "offline-key-events=1",
-  "native-ufs-root=1",
   "sheng-pmgr=2",
-  "armcpu-diagnostics=1",
-  "sheng-disable-watchdogd=1",
-  "sheng-disable-jobs=com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
-  "boot-ui-focus3=Preferences",
-  "boot-ui-focus4=SpringBoard",
-  "sheng-smp=1",
-  "sheng-cpufreq=3",
-  "sheng-touch=4",
-  "sheng-aks=1",
-  "sheng-gpu-power=9",
-  "sheng-gpu-metal=1",
-  "sheng-fb-gpu=1",
-  "sheng-banner=0",
-  "sheng-gpu-perf=8",
-  "sheng-gpu-addon=1",
-  "armcpu-spi-ipi=1",
   "-no_slto_panic",
-  "ml-timeout-lock-panic-scale=40",
-  "sheng-touch-hid=1",
-  "sheng-data-persist=2",
+  "rd=md0",
 ]
 
+# Parked. These were carried over from the sheng-family boards and none of them
+# has been measured on this device. Two reasons they are out:
+#
+#   * most have no consumer in this kernel at all. Their PE_parse_boot_argn
+#     lives in a package/ source whose builder is not in [kernel] archives --
+#     LegacyDisplayProbe.cpp, HidInputProbe.cpp, KeyStoreProbe.cpp,
+#     CpuFreqProbe.cpp, TouchProbe.cpp, GpuPowerProbe.cpp, BootProgress.c,
+#     BootProcessProbe.c, BootWatchdogPolicy.c -- so they are read by nothing;
+#   * sheng-smp, armcpu-spi-ipi and armcpu-diagnostics are the exception: they
+#     are live, parsed by ArmCpu.cpp (lines 33, 159, 188, 190, 368), which
+#     component:ArmCpu does build. sheng-smp brings the secondary cores up, and
+#     the full 42-entry set gave a green bar with no kernel entry twice before
+#     the eight above went through first time. Those three are the ones worth a
+#     round of their own, one at a time, against cpus=1 above.
+#
+# Return each one when its archive is built and the round that adds it is the
+# only thing that changed.
+#   "serial=3",
+#   "offline-legacy-register=1",
+#   "offline-legacy-gop=1",
+#   "offline-legacy-unit-scale=2",
+#   "offline-legacy-pm=1",
+#   "offline-legacy-validate=1",
+#   "offline-legacy-transfer=1",
+#   "offline-legacy-cpu-present=1",
+#   "offline-hid-home=1",
+#   "offline-hid-input=1",
+#   "offline-legacy-phase=4",
+#   "offline-mobile-graphics-client=1",
+#   "offline-mobile-graphics-load=1",
+#   "offline-apfs-load=1",
+#   "-apfs_shared_datavolume",
+#   "offline-key-events=1",
+#   "armcpu-diagnostics=1",
+#   "sheng-disable-watchdogd=1",
+#   "sheng-disable-jobs=com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
+#   "boot-ui-focus3=Preferences",
+#   "boot-ui-focus4=SpringBoard",
+#   "sheng-smp=1",
+#   "sheng-cpufreq=3",
+#   "sheng-touch=4",
+#   "sheng-aks=1",
+#   "sheng-gpu-power=9",
+#   "sheng-gpu-metal=1",
+#   "sheng-fb-gpu=1",
+#   "sheng-banner=0",
+#   "sheng-gpu-perf=8",
+#   "sheng-gpu-addon=1",
+#   "armcpu-spi-ipi=1",
+#   "ml-timeout-lock-panic-scale=40",
+#   "sheng-touch-hid=1",
+#   "sheng-data-persist=2",
+
 [payload.adt]
-tool = "scripts/make-vermeer-adt.py"
 chip_id = "207"
-owned_memory_size = "0x130000000"
+owned_memory_size = "0x20000000"   # 512 MiB: the window DarwinBoot can actually allocate on this device (observed BIG RUN ~0x3B300000)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
-packed_data_ramdisk = true
-ipad_identity = true
+# false, measured: true against a payload that is not packed takes DarwinBoot
+# through KeepPacked && !RamdiskPacked to EFI_COMPROMISED_DATA and back to the
+# menu. Every rd=md0 round that reached the kernel on this device used false.
+packed_data_ramdisk = false
 unique_chip_id = "required"          # the platform seed is not stored in any repository
 
 # Image parameters come from the Mu-Silicium device config; [bootimg.image] would override them.

@@ -2,11 +2,11 @@ name: build-kernel
 
 # Build the flashable artifacts for Redmi K70 (vermeer) on GitHub runners.
 #
-# kernel (macos-14)   XNU + prelink -> out/vermeer/kernel/kernel.macho
+# kernel (macos-15)   XNU + prelink -> out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho
 #                     (needs xcodebuild's iphoneos SDK and the Homebrew LLVM/LLD toolchain)
 # firmware (ubuntu)   Mu-Silicium vermeerPkg -> Build/vermeerPkg/<target>_CLANGPDB/FV/SILICIUM_UEFI.fd
 #                     (EDK II CLANGPDB; aarch64-linux-gnu- supplies the binutils EDK II expects)
-# bootimg (ubuntu)    package + payload + bootimg -> out/vermeer/boot/boot.img
+# bootimg (ubuntu)    package + payload + bootimg -> out/vermeer/ipados-17.7.11-21H461/vermeer/boot/boot.img
 #                     (BootShim + FD, gzip, the device DTB with the splash node, payload ramdisk)
 #
 # Layout on the runner:
@@ -19,13 +19,18 @@ name: build-kernel
 # components listed in board.toml [ipsw] fetch straight from the Apple CDN; out/ipsw is
 # cached between runs.
 
+# Posting the failing log as a commit comment needs write access to the
+# repository contents; the default token is read-only here.
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
     inputs:
       unique_chip_id:
-        description: 'Platform seed for the device tree (8-byte hex). Empty = the payload step is skipped.'
+        description: 'Platform seed for the device tree (8-byte hex). Empty = the committed CI default is used.'
         required: false
         default: ''
 
@@ -41,6 +46,9 @@ jobs:
     steps:
       - name: Checkout device repository (UniXNU-vermeer)
         uses: actions/checkout@v4
+
+      - name: Check the committed board configuration is not a build profile
+        run: python3 scripts/ci-build-profile.py --verify
 
       - name: Checkout UniXNU build system (with submodules)
         uses: actions/checkout@v4
@@ -73,12 +81,40 @@ jobs:
         run: |
           python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
 
-      - name: Build kernel (XNU + prelink, kernelcache from the IPSW)
+      - name: Build kernel (pass 1 of 2, PMGR off, mints the prelink reference candidate)
         env:
           # prepare-xnu-source.py falls back to the GitHub contents API only when git cannot
           # reach the reference; the token keeps that fallback out of the shared rate-limit bucket.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # build-sheng-platform-power.py reads the original ApplePMGR class ABI out of a
+          # kernel that was already prelinked against the same kernelcache, so a clean
+          # checkout has nothing to read and archive-10 stops with
+          # "No reference candidate available". That candidate is a build product carrying
+          # Apple kext bytes and is never committed, so it is minted here instead: pass 1
+          # builds with the PMGR archive switched off, pass 2 builds the delivered kernel.
+          python3 scripts/ci-build-profile.py --drop-pmgr --drop-gpu
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+          python3 unixnu/unixnu build kernel -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+
+      - name: Mint the prelink reference candidate
+        run: |
+          TREE=out/vermeer/ipados-17.7.11-21H461/vermeer/tree
+          mkdir -p "$TREE/build/native-prelink"
+          cp out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho \
+             "$TREE/build/native-prelink/native-owner-ufs-cpu-desktop-bootstrap0-candidate.macho"
+          ls -l "$TREE/build/native-prelink"
+
+      - name: Build kernel (pass 2 of 2, PMGR on, the delivered kernel)
+        env:
+          # prepare-xnu-source.py falls back to the GitHub contents API only when git cannot
+          # reach the reference; the token keeps that fallback out of the shared rate-limit bucket.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout -- board.toml configs/vermeer_defconfig
+          # Adreno740 is out on this runner too; see scripts/ci-build-profile.py --drop-gpu.
+          python3 scripts/ci-build-profile.py --drop-gpu
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
           python3 unixnu/unixnu build kernel -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
 
       - name: Upload prelinked kernel
@@ -86,16 +122,244 @@ jobs:
         with:
           name: vermeer-kernel
           path: |
-            out/vermeer/kernel/kernel.macho
-            out/vermeer/kernel/kernel.macho.json
+            out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho
+            out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho.json
           if-no-files-found: error
+
+      - name: Post the failing log where it can be read without the artifact store
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach. A commit comment goes through the ordinary API, so
+          # the tail of every build log stays readable from anywhere gh works.
+          LOGS=out/vermeer/ipados-17.7.11-21H461/vermeer/logs
+          BODY=$(mktemp)
+          {
+            echo "### \`${{ github.job }}\` failed on ${{ runner.os }} (run ${{ github.run_id }})"
+            echo
+            for f in "$LOGS"/*.log; do
+              [ -f "$f" ] || continue
+              echo "<details><summary>$(basename "$f") (tail)</summary>"
+              echo
+              echo '```'
+              tail -c 6000 "$f"
+              echo '```'
+              echo "</details>"
+              echo
+            done
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vermeer-kernel-logs
-          path: out/vermeer/logs/
+          path: out/vermeer/ipados-17.7.11-21H461/vermeer/logs/
+          if-no-files-found: warn
+
+  # The documented Linux kernel path (unixnu.com/zh/building): scripts/linux/setup-toolchain.py
+  # supplies patched clang, cctools-port (ld64/nm/lipo), mig, iig-port and lzfse in place of the
+  # Apple tools, so the kernel stops depending on macOS arm64 runner capacity -- three runs in a
+  # row were killed in the queue with "The job was not acquired by Runner of type hosted even
+  # after multiple attempts". The toolchain is built from source once and cached; a cache hit
+  # leaves setup-toolchain.py only its /usr/bin shims to install.
+  #
+  # This job is additive: it uploads its own artifact and the macos-15 "kernel" job above is
+  # untouched, so neither route can break the other.
+  kernel-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      UNIXNU_TOOLCHAIN: /home/runner/unixnu-linux
+
+    steps:
+      - name: Checkout device repository (UniXNU-vermeer)
+        uses: actions/checkout@v4
+
+      - name: Check the committed board configuration is not a build profile
+        run: python3 scripts/ci-build-profile.py --verify
+
+      - name: Checkout UniXNU build system (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          submodules: recursive
+          path: unixnu
+
+      - name: Cache the Linux kernel toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UNIXNU_TOOLCHAIN }}
+          key: unixnu-linux-toolchain-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py') }}
+
+      - name: Install the Linux toolchain
+        run: |
+          sudo python3 unixnu/scripts/linux/setup-toolchain.py "$UNIXNU_TOOLCHAIN"
+
+      - name: Show toolchain
+        run: |
+          "$UNIXNU_TOOLCHAIN/llvm/bin/clang" --version | head -n 1
+          ls -l "$UNIXNU_TOOLCHAIN/CommandLineTools/usr/bin/ld" \
+                "$UNIXNU_TOOLCHAIN/CommandLineTools/usr/libexec/migcom" \
+                "$UNIXNU_TOOLCHAIN/XcodeDefault.xctoolchain/usr/bin/iig" \
+                "$UNIXNU_TOOLCHAIN/bin/lzfse" /usr/bin/xcrun
+          dtc --version | head -n 1
+
+      - name: Cache IPSW components
+        uses: actions/cache@v4
+        with:
+          path: out/ipsw
+          key: ipsw-linux-${{ hashFiles('board.toml') }}
+
+      - name: Configure (defconfig vermeer)
+        run: |
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+
+      - name: Build kernel (pass 1 of 2, PMGR off, mints the prelink reference candidate)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # build-sheng-platform-power.py reads the original ApplePMGR class ABI out of a
+          # kernel that was already prelinked against the same kernelcache, so a clean
+          # checkout has nothing to read and archive-10 stops with
+          # "No reference candidate available". That candidate is a build product carrying
+          # Apple kext bytes and is never committed, so it is minted here instead: pass 1
+          # builds with the PMGR archive switched off, pass 2 builds the delivered kernel.
+          python3 scripts/ci-build-profile.py --drop-pmgr --drop-gpu
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+          python3 unixnu/unixnu build kernel -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+
+      - name: Mint the prelink reference candidate
+        run: |
+          TREE=out/vermeer/ipados-17.7.11-21H461/vermeer/tree
+          mkdir -p "$TREE/build/native-prelink"
+          cp out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho \
+             "$TREE/build/native-prelink/native-owner-ufs-cpu-desktop-bootstrap0-candidate.macho"
+          ls -l "$TREE/build/native-prelink"
+
+      - name: Build kernel (pass 2 of 2, PMGR on, the delivered kernel)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout -- board.toml configs/vermeer_defconfig
+          # The GPU archives stay out on this runner in both passes; see
+          # scripts/ci-build-profile.py for why they cannot be built here.
+          python3 scripts/ci-build-profile.py --drop-gpu
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+          python3 unixnu/unixnu build kernel -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+
+      - name: Upload prelinked kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: vermeer-kernel-linux
+          path: |
+            out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho
+            out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.json
+          if-no-files-found: error
+
+      - name: Upload the XNU build records the audits read
+        uses: actions/upload-artifact@v4
+        with:
+          # audit-storage-interface.py, audit-aes-interface.py and the archive
+          # builders read the native kernel and the per-object compile records of
+          # the XNU build; the run 41011352600 inventory confirmed this runner
+          # leaves all of them in the tree (ios-obj is 421 MB whole, so only the
+          # reference kernel and the records go out, ~25 MB).
+          name: vermeer-xnu-records
+          path: |
+            out/vermeer/ipados-17.7.11-21H461/vermeer/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+            out/vermeer/ipados-17.7.11-21H461/vermeer/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/compile_commands.json
+            out/vermeer/ipados-17.7.11-21H461/vermeer/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/**/*.o.json
+            out/vermeer/ipados-17.7.11-21H461/vermeer/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/**/*.cpo.json
+          if-no-files-found: error
+
+      - name: Report the build tree inventory as a commit comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach, so there is no way to find out from outside which
+          # paths a Linux build actually leaves in the tree. The audit scripts need
+          # build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837 (IOPlatformExpert.cpo.json and
+          # mach.development.bcm2837.unstripped.noctf); whether this runner produces it
+          # decides what the next round can upload. A commit comment goes through the
+          # ordinary API, so this listing stays readable from anywhere gh works.
+          TREE=out/vermeer/ipados-17.7.11-21H461/vermeer/tree
+          BODY=$(mktemp)
+          {
+            echo "### \`kernel-linux\` tree inventory (run ${{ github.run_id }})"
+            echo
+            echo '```'
+            echo "== kernel/ =="
+            ls -l out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/ 2>&1 | head -n 20
+            echo
+            echo "== tree/build top level =="
+            ls -1 "$TREE/build" 2>&1 | head -n 60
+            echo
+            echo "== tree/build/xnu =="
+            ls -1 "$TREE/build/xnu" 2>&1 | head -n 20
+            echo
+            echo "== ios-obj target dir =="
+            ls -l "$TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837" 2>&1 | head -n 30
+            echo
+            echo "== the two files the audits need =="
+            for f in "$TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf" \
+                     "$TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"; do
+              if [ -f "$f" ]; then
+                echo "PRESENT  $(stat -c '%s' "$f") bytes  $f"
+              else
+                echo "ABSENT   $f"
+              fi
+            done
+            echo
+            echo "== ios-obj size =="
+            du -sh "$TREE/build/xnu/ios-obj" 2>&1 | head -n 2
+            echo '```'
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
+
+      - name: Post the failing log where it can be read without the artifact store
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach. A commit comment goes through the ordinary API, so
+          # the tail of every build log stays readable from anywhere gh works.
+          LOGS=out/vermeer/ipados-17.7.11-21H461/vermeer/logs
+          BODY=$(mktemp)
+          {
+            echo "### \`${{ github.job }}\` failed on ${{ runner.os }} (run ${{ github.run_id }})"
+            echo
+            for f in "$LOGS"/*.log; do
+              [ -f "$f" ] || continue
+              echo "<details><summary>$(basename "$f") (tail)</summary>"
+              echo
+              echo '```'
+              tail -c 6000 "$f"
+              echo '```'
+              echo "</details>"
+              echo
+            done
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vermeer-kernel-linux-logs
+          path: out/vermeer/ipados-17.7.11-21H461/vermeer/logs/
           if-no-files-found: warn
 
   firmware:
@@ -105,6 +369,9 @@ jobs:
     steps:
       - name: Checkout device repository (UniXNU-vermeer)
         uses: actions/checkout@v4
+
+      - name: Check the committed board configuration is not a build profile
+        run: python3 scripts/ci-build-profile.py --verify
 
       - name: Checkout UniXNU build system (with submodules)
         uses: actions/checkout@v4
@@ -158,8 +425,36 @@ jobs:
           name: vermeer-firmware
           path: |
             uefi/Build/vermeerPkg/*/FV/SILICIUM_UEFI.fd
-            out/vermeer/package/Build/Out/
+            out/vermeer/ipados-17.7.11-21H461/vermeer/package/Build/Out/
           if-no-files-found: error
+
+      - name: Post the failing log where it can be read without the artifact store
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach. A commit comment goes through the ordinary API, so
+          # the tail of every build log stays readable from anywhere gh works.
+          LOGS=out/vermeer/ipados-17.7.11-21H461/vermeer/logs
+          BODY=$(mktemp)
+          {
+            echo "### \`${{ github.job }}\` failed on ${{ runner.os }} (run ${{ github.run_id }})"
+            echo
+            for f in "$LOGS"/*.log; do
+              [ -f "$f" ] || continue
+              echo "<details><summary>$(basename "$f") (tail)</summary>"
+              echo
+              echo '```'
+              tail -c 6000 "$f"
+              echo '```'
+              echo "</details>"
+              echo
+            done
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
 
       - name: Upload build logs
         if: always()
@@ -167,18 +462,134 @@ jobs:
         with:
           name: vermeer-firmware-logs
           path: |
-            out/vermeer/logs/
+            out/vermeer/ipados-17.7.11-21H461/vermeer/logs/
             uefi/Build/vermeerPkg/*/AARCH64/*.txt
           if-no-files-found: warn
 
-  bootimg:
+  # Stages 1 and 2 of the bring-up order (unixnu.com/zh/porting/bring-up): get the firmware into
+  # UEFI and the UniXNU menu onto the panel. Those stages need the firmware volume and a compiled
+  # device tree -- no kernel, no payload and no platform seed -- so this job depends on firmware
+  # alone and packs the empty-ramdisk image the bring-up doc asks for:
+  #   ./unixnu bootimg --uefi <Mu-Silicium> --dtb board.dtb --ramdisk none
+  # The existing bootimg job below needs [kernel, firmware], so while the macos-15 kernel job keeps
+  # being cancelled in the queue it is skipped and no image is produced at all.
+  bootimg-menu:
     runs-on: ubuntu-24.04
-    needs: [kernel, firmware]
+    needs: [firmware]
     timeout-minutes: 60
 
     steps:
       - name: Checkout device repository (UniXNU-vermeer)
         uses: actions/checkout@v4
+
+      - name: Check the committed board configuration is not a build profile
+        run: python3 scripts/ci-build-profile.py --verify
+
+      - name: Checkout UniXNU build system (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          submodules: recursive
+          path: unixnu
+
+      - name: Checkout Mu-Silicium device firmware (uefi-vermeer)
+        uses: actions/checkout@v4
+        with:
+          repository: yyx2025/uefi-vermeer
+          ref: vermeer
+          submodules: recursive
+          path: uefi
+
+      - name: Download the firmware volume
+        uses: actions/download-artifact@v4
+        with:
+          name: vermeer-firmware
+          path: firmware-artifact
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build device-tree-compiler mtools \
+            python3 python3-pip clang lld llvm git curl
+          python3 -m pip install --break-system-packages -r uefi/pip-requirements.txt
+
+      - name: Place the firmware volume where the driver expects it
+        run: |
+          mkdir -p "uefi/Build/vermeerPkg/DEBUG_CLANGPDB/FV"
+          cp firmware-artifact/uefi/Build/vermeerPkg/*/FV/SILICIUM_UEFI.fd \
+             "uefi/Build/vermeerPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd"
+          ls -l "uefi/Build/vermeerPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd"
+
+      - name: Configure (defconfig vermeer)
+        run: |
+          python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
+
+      - name: Pack the menu-only boot image (BootShim + FD + DTB, empty ramdisk)
+        run: |
+          python3 unixnu/unixnu bootimg \
+            -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out" \
+            --uefi "$GITHUB_WORKSPACE/uefi" \
+            --dtb "$GITHUB_WORKSPACE/scripts/data/vermeer.dtb" \
+            --ramdisk none
+
+      - name: Upload the menu-only boot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: vermeer-boot-menu
+          path: |
+            out/vermeer/ipados-17.7.11-21H461/vermeer/boot/boot.img
+            out/vermeer/ipados-17.7.11-21H461/vermeer/boot/boot.json
+          if-no-files-found: error
+
+      - name: Post the failing log where it can be read without the artifact store
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach. A commit comment goes through the ordinary API, so
+          # the tail of every build log stays readable from anywhere gh works.
+          LOGS=out/vermeer/ipados-17.7.11-21H461/vermeer/logs
+          BODY=$(mktemp)
+          {
+            echo "### \`${{ github.job }}\` failed on ${{ runner.os }} (run ${{ github.run_id }})"
+            echo
+            for f in "$LOGS"/*.log; do
+              [ -f "$f" ] || continue
+              echo "<details><summary>$(basename "$f") (tail)</summary>"
+              echo
+              echo '```'
+              tail -c 6000 "$f"
+              echo '```'
+              echo "</details>"
+              echo
+            done
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vermeer-bootimg-menu-logs
+          path: out/vermeer/ipados-17.7.11-21H461/vermeer/logs/
+          if-no-files-found: warn
+
+  bootimg:
+    runs-on: ubuntu-24.04
+    # kernel-linux, not the macos-15 kernel job: that one keeps being cancelled in the queue
+    # ("not acquired by Runner of type hosted"), which skipped bootimg with it every time.
+    needs: [kernel-linux, firmware]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout device repository (UniXNU-vermeer)
+        uses: actions/checkout@v4
+
+      - name: Check the committed board configuration is not a build profile
+        run: python3 scripts/ci-build-profile.py --verify
 
       - name: Checkout UniXNU build system (with submodules)
         uses: actions/checkout@v4
@@ -198,8 +609,8 @@ jobs:
       - name: Download the prelinked kernel
         uses: actions/download-artifact@v4
         with:
-          name: vermeer-kernel
-          path: out/vermeer/kernel
+          name: vermeer-kernel-linux
+          path: out/vermeer/ipados-17.7.11-21H461/vermeer/kernel
 
       - name: Download the firmware volume
         uses: actions/download-artifact@v4
@@ -249,33 +660,46 @@ jobs:
              "uefi/Build/vermeerPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd"
           ls -l "uefi/Build/vermeerPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd"
 
+      - name: Pack the plain baseline, not the ramdisk-root round
+        run: |
+          # The payload step below is not given --data-ramdisk, and payload.py only
+          # emits the ADT ramdisk flag when it is, so an image built from the device
+          # repository as it stands would carry rd=md0 and the stage 4 probe with no
+          # /chosen/memory-map/RAMDisk behind them. See scripts/ci-build-profile.py.
+          python3 scripts/ci-build-profile.py --baseline-boot
+
       - name: Configure (defconfig vermeer)
         run: |
           python3 unixnu/unixnu defconfig vermeer_defconfig -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out"
 
       - name: Build the payload volume
         env:
-          # The platform seed is not stored in any repository (board.toml [payload.adt]
-          # unique_chip_id = "required"). Supply it as a workflow input or a repository
-          # secret; without it the payload cannot be written.
-          UNIXNU_UNIQUE_CHIP_ID: ${{ inputs.unique_chip_id || secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          # /chosen/unique-chip-id seeds XNU's IOPlatformUUID. Upstream documents it as a
+          # "software identity seed, not Apple silicon IDs" (scripts/make-sheng-adt.py:82) and
+          # validates only that it is nonzero and fits 8 bytes, so it is not device-secret
+          # material: UniXNU-clover builds with a fixed 0x81ffcaaa throughout its development
+          # log. The same value is the default here so that an unattended push still produces
+          # a flashable boot image. A real device seed still overrides it.
+          # Precedence: workflow_dispatch input > UNIXNU_UNIQUE_CHIP_ID secret > this default.
+          UNIXNU_UNIQUE_CHIP_ID: ${{ inputs.unique_chip_id || secrets.UNIXNU_UNIQUE_CHIP_ID || '0x81ffcaaa' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "${UNIXNU_UNIQUE_CHIP_ID}" ]; then
-            echo "::warning::No --unique-chip-id (workflow input or UNIXNU_UNIQUE_CHIP_ID secret); skipping the payload and the boot image"
-            exit 0
+            echo "::error::No platform seed and no default; the payload cannot be written"
+            exit 1
           fi
+          echo "Platform seed: ${UNIXNU_UNIQUE_CHIP_ID}"
           python3 unixnu/unixnu build payload \
             -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out" \
             --uefi "$GITHUB_WORKSPACE/uefi" \
-            --kernel "$GITHUB_WORKSPACE/out/vermeer/kernel/kernel.macho" \
+            --kernel "$GITHUB_WORKSPACE/out/vermeer/ipados-17.7.11-21H461/vermeer/kernel/kernel.macho" \
             --unique-chip-id "$UNIXNU_UNIQUE_CHIP_ID"
 
       - name: Pack the boot image (BootShim + FD + DTB + payload)
         run: |
-          if [ ! -f out/vermeer/payload/payload.img ]; then
-            echo "::warning::No payload volume; skipping bootimg"
-            exit 0
+          if [ ! -f out/vermeer/ipados-17.7.11-21H461/vermeer/payload/payload.img ]; then
+            echo "::error::No payload volume; the previous step did not write one"
+            exit 1
           fi
           python3 unixnu/unixnu bootimg \
             -D "$GITHUB_WORKSPACE" --out "$GITHUB_WORKSPACE/out" \
@@ -287,16 +711,44 @@ jobs:
         with:
           name: vermeer-boot
           path: |
-            out/vermeer/boot/boot.img
-            out/vermeer/boot/boot.json
-            out/vermeer/payload/payload.img
-            out/vermeer/payload/payload.json
-          if-no-files-found: warn
+            out/vermeer/ipados-17.7.11-21H461/vermeer/boot/boot.img
+            out/vermeer/ipados-17.7.11-21H461/vermeer/boot/boot.json
+            out/vermeer/ipados-17.7.11-21H461/vermeer/payload/payload.img
+            out/vermeer/ipados-17.7.11-21H461/vermeer/payload/payload.json
+          if-no-files-found: error
+
+      - name: Post the failing log where it can be read without the artifact store
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The artifact and raw-log endpoints redirect to blob storage, which some
+          # networks cannot reach. A commit comment goes through the ordinary API, so
+          # the tail of every build log stays readable from anywhere gh works.
+          LOGS=out/vermeer/ipados-17.7.11-21H461/vermeer/logs
+          BODY=$(mktemp)
+          {
+            echo "### \`${{ github.job }}\` failed on ${{ runner.os }} (run ${{ github.run_id }})"
+            echo
+            for f in "$LOGS"/*.log; do
+              [ -f "$f" ] || continue
+              echo "<details><summary>$(basename "$f") (tail)</summary>"
+              echo
+              echo '```'
+              tail -c 6000 "$f"
+              echo '```'
+              echo "</details>"
+              echo
+            done
+          } > "$BODY"
+          head -c 60000 "$BODY" > "$BODY.cut"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -F body=@"$BODY.cut" || echo "could not post the comment"
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vermeer-bootimg-logs
-          path: out/vermeer/logs/
+          path: out/vermeer/ipados-17.7.11-21H461/vermeer/logs/
           if-no-files-found: warn
